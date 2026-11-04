@@ -971,15 +971,38 @@ async function drawItem(out,c,it,font,img){
       c.pg.node.addAnnot(out.context.register(ann));break}
   }
 }
+/* reparar PDFs con estructura incompleta (p. ej. índice sin /Type /Catalog) */
+async function repairDoc(d){
+  if(typeof d.catalog.Pages==='function')return d;
+  const {PDFCatalog,PDFPageTree,PDFPageLeaf,PDFRef}=PDFLib;
+  const ctx=d.context,root=ctx.trailerInfo.Root;
+  const conv=(ref,Cls,type)=>{const n=ctx.lookup(ref);if(!n||!n.dict||n instanceof Cls)return n;const m=new Map(n.dict);m.set(PDFName.of('Type'),PDFName.of(type));
+    const nn=Cls.fromMapWithContext(m,ctx);if(ref instanceof PDFRef)ctx.assign(ref,nn);return nn};
+  const cat=conv(root,PDFCatalog,'Catalog');if(!cat)throw new Error('El PDF no tiene índice de páginas');d.catalog=cat;
+  const seen=new Set();const walk=ref=>{if(!(ref instanceof PDFRef)||seen.has(ref.tag))return;seen.add(ref.tag);const n=ctx.lookup(ref);if(!n||!n.dict)return;
+    const kids=n.get(PDFName.of('Kids'));if(kids){conv(ref,PDFPageTree,'Pages');const arr=ctx.lookup(kids);for(let i=0;i<arr.size();i++)walk(arr.get(i))}else conv(ref,PDFPageLeaf,'Page')};
+  walk(cat.get(PDFName.of('Pages')));
+  if(typeof d.catalog.Pages!=='function')throw new Error('No se pudo reparar el PDF');return d}
+/* último recurso: convertir la página en imagen de alta calidad */
+async function rasterPage(out,p){
+  const pg=await st.srcs[p.s].doc.getPage(p.i+1),v1=pg.getViewport({scale:1,rotation:0}),vp=pg.getViewport({scale:200/72,rotation:0});
+  const c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);
+  await pg.render({canvasContext:x,viewport:vp}).promise;
+  const jpg=await out.embedJpg(await (await fetch(c.toDataURL('image/jpeg',.92))).arrayBuffer());
+  const np=out.addPage([v1.width,v1.height]);np.drawImage(jpg,{x:0,y:0,width:v1.width,height:v1.height});np.__raster=true;return np}
 async function buildPdf(pages){
   const out=await PDFDocument.create(),libs={};
-  const lib=async si=>{if(libs[si])return libs[si];const S=st.srcs[si];
-    try{libs[si]=await PDFDocument.load(S.bytes,{password:S.pwd||'',updateMetadata:false})}catch(e){console.warn(e);libs[si]=await PDFDocument.load(S.bytes,{ignoreEncryption:true,updateMetadata:false})}return libs[si]};
+  const lib=async si=>{if(libs[si]!==undefined)return libs[si];const S=st.srcs[si];let d=null;
+    for(const opt of [{password:S.pwd||''},{ignoreEncryption:true}]){
+      try{let t=await PDFDocument.load(S.bytes,{...opt,updateMetadata:false});t=await repairDoc(t);t.getPages();d=t;break}catch(e){console.warn('pdf-lib no pudo leer el archivo',e)}}
+    return libs[si]=d};
   const need={};pages.forEach((p,k)=>(need[p.s]=need[p.s]||[]).push(k));const copied=[];
-  for(const si in need){const d=await lib(si);const cps=await out.copyPages(d,need[si].map(k=>pages[k].i));need[si].forEach((k,j)=>copied[k]=cps[j])}
+  for(const si in need){const d=await lib(si),idx=need[si];
+    if(d){try{const cps=await out.copyPages(d,idx.map(k=>pages[k].i));idx.forEach((k,j)=>copied[k]=cps[j]);continue}catch(e){console.warn('copyPages falló',e)}}
+    for(const k of idx)copied[k]=await rasterPage(out,pages[k]);st.rasterWarn=true}
   const fc={},icache={};const font=async n=>fc[n]||(fc[n]=await out.embedFont(StandardFonts[n]));
   const img=async key=>icache[key]||(icache[key]=await (async()=>{const d=st.imgs[key];const b=await (await fetch(d)).arrayBuffer();return d.startsWith('data:image/jpeg')?out.embedJpg(b):out.embedPng(b)})());
-  for(let k=0;k<pages.length;k++){const p=pages[k],pg=out.addPage(copied[k]);pg.setRotation(degrees((p.base.r+p.rot)%360));
+  for(let k=0;k<pages.length;k++){const p=pages[k],pg=copied[k].__raster?copied[k]:out.addPage(copied[k]);pg.setRotation(degrees((p.base.r+p.rot)%360));
     const c={pg,cb:pg.getCropBox(),r:p.base.r};
     for(const it of p.items)await drawItem(out,c,it,font,img);
     if(p.ocr&&p.ocr.length){const f=await font('Helvetica');for(const w of p.ocr){const s=cleanText(w.t,f);if(!s.trim())continue;let size=w.h*.9;const tw=f.widthOfTextAtSize(s,size);if(tw>0)size=clamp(size*w.w/tw,w.h*.4,w.h*1.6);
@@ -1016,7 +1039,7 @@ async function save(as){
       const w=await h.createWritable();await w.write(blob);await w.close();st.handle=h;st.name=h.name;done();return}
   }catch(e){if(e.name==='AbortError')return;console.warn(e)}
   download(blob,as?baseName()+'_editado.pdf':st.name.replace(/\.pdf$/i,'')+(st.name.endsWith('_editado.pdf')?'':'_editado')+'.pdf');done();
-  function done(){st.dirty=false;updateUndo();$('#docName').textContent=st.name;toast('Documento guardado'+(st.security?' con contraseña':''))}
+  function done(){st.dirty=false;updateUndo();$('#docName').textContent=st.name;toast('Documento guardado'+(st.security?' con contraseña':'')+(st.rasterWarn?'. Algunas páginas dañadas se guardaron como imagen':''),st.rasterWarn?5000:2600);st.rasterWarn=false}
 }
 async function doPrint(){if(!need())return;busy('Preparando impresión...');await tick();
   try{const bytes=await finalBytes(st.pages,{secure:false});const url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));
